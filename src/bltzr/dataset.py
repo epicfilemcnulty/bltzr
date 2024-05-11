@@ -5,6 +5,7 @@ from psycopg2 import sql
 from torch.nn.utils.rnn import pad_sequence 
 from dataclasses import dataclass
 from torch.utils.data import Dataset
+from .tokenizer import Tokenizer
 
 # This is not an optimal implementation -- although
 # the actual data lives in Postgres, when we init the class
@@ -14,14 +15,14 @@ from torch.utils.data import Dataset
 # and store it in memory.
 
 @dataclass
-class ByteDatasetConfig:
+class SqlDatasetConfig:
     db_host: str
     db_user: str
-    db: str
+    db_name: str
     dataset_table: str = "dataset"
     window_size: int = 8192
 
-class ByteDataset(Dataset):
+class SqlDataset(Dataset):
 
     def get_conn(self):
         return self.pool.getconn()
@@ -29,10 +30,10 @@ class ByteDataset(Dataset):
     def release_conn(self, conn):
         self.pool.putconn(conn)
 
-    def __init__(self, config, tokenizer):
-        super(ByteDataset, self).__init__()
+    def __init__(self, config):
+        super(SqlDataset, self).__init__()
         self.config = config
-        self.tokenizer = tokenizer
+        self.tokenizer = Tokenizer()
         self.chunks = []
         # Create a connection pool
         self.pool = SimpleConnectionPool(
@@ -109,7 +110,7 @@ class ByteDataset(Dataset):
         return dict(input_ids=padded_input_ids, labels=labels_tensor)
 
 @dataclass
-class DataCollatorForByteDataset(object):
+class DataCollatorForSqlDataset(object):
 
     def __init__(self, pad_token_id=0):
         self.pad_token_id = pad_token_id
@@ -125,7 +126,8 @@ class DataCollatorForByteDataset(object):
             'labels': labels,
         }
 
-class ByteDataModule():
-    def __init__(self, config: ByteDatasetConfig, tokenizer):
-        self.dataset = ByteDataset(config, tokenizer)
-        self.data_collator = DataCollatorForByteDataset(tokenizer.get_token_id('<PAD>'))
+class SqlDataModule():
+    def __init__(self, config: SqlDatasetConfig):
+        self.dataset = SqlDataset(config)
+        tokenizer = Tokenizer()
+        self.data_collator = DataCollatorForSqlDataset(tokenizer.get_token_id('<PAD>'))

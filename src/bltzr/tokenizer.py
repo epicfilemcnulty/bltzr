@@ -39,11 +39,8 @@ SPECIAL_TOKENS = {
 }
 
 class Tokenizer:
-    def __init__(self, special_tokens=None):
-        if special_tokens is not None:
-            self.special_tokens = special_tokens
-        else:
-            self.special_tokens = SPECIAL_TOKENS
+    def __init__(self):
+        self.special_tokens = SPECIAL_TOKENS
         self.vocab = list(range(256)) + list(self.special_tokens.keys())
 
     def get_token_id(self, token):
