@@ -39,7 +39,7 @@ class SqlDataset(Dataset):
         self.pool = SimpleConnectionPool(
             minconn=1,
             maxconn=20,
-            dsn="dbname={} user={} host={}".format(config.db, config.db_user, config.db_host)
+            dsn="dbname={} user={} host={}".format(config.db_name, config.db_user, config.db_host)
         )
         conn = self.get_conn()
         print("Calculating dataset length, hold on...")
