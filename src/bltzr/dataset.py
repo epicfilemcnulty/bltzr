@@ -46,68 +46,54 @@ class SqlDataset(Dataset):
         with conn.cursor() as cur:
             cur.execute(sql.SQL("SELECT tbl, ref_id FROM {}").format(sql.Identifier(config.dataset_table)))
             rows = cur.fetchall()
+            chunk = {"src": []}
+            payload_added = 0
             for row in rows:
-                if row[0] == 'chats':
-                    cur.execute("SELECT len FROM chats WHERE id = %s", (row[1],))
-                    chat_raw = cur.fetchone()
-                    total_len = int(chat_raw[0])
-                    chunks = total_len // self.config.window_size
-                    rest_bytes = total_len - chunks * self.config.window_size
-                    if rest_bytes > 0:
-                        chunks += 1
-                    self.chunks.append({"chunks": chunks, "tbl": row[0], "ref": row[1]})
-                else:
-                    cur.execute(sql.SQL("SELECT octet_length(content) FROM {} WHERE id = %s").format(sql.Identifier(row[0])), (row[1],))
-                    txt_len = cur.fetchone()
-                    chunks = (txt_len[0] + 2) // self.config.window_size
-                    rest_bytes = (txt_len[0] + 2) - chunks * self.config.window_size
-                    if rest_bytes > 0:
-                        chunks += 1
-                    self.chunks.append({"chunks": chunks, "tbl": row[0], "ref": row[1]})
+                cur.execute(sql.SQL("SELECT octet_length(content) FROM {} WHERE id = %s").format(sql.Identifier(row[0])), (row[1],))
+                txt_len = cur.fetchone()[0]
+                remaining_len = txt_len
+                ofs = 0
+                while remaining_len > 0:
+                    payload_len = min(self.config.window_size - payload_added, remaining_len)
+                    chunk["src"].append({"tbl": row[0], "ref": row[1], "ofs": ofs, "len": payload_len})
+                    payload_added += payload_len
+                    remaining_len -= payload_len
+                    ofs += payload_len
+                    if payload_added >= self.config.window_size:
+                        self.chunks.append(chunk)
+                        chunk = {"src": []}
+                        payload_added = 0
+            if payload_added > 0:
+                chunk["last"] = True
+                self.chunks.append(chunk)
         print("Done!")
         self.release_conn(conn)
 
-    def __len__(self):
-        total = 0
-        for chunk in self.chunks:
-            total += chunk['chunks']
-        return total
-
-    def map_idx(self, i):
-        accum_chunks = 0
-        for idx, chunk in enumerate(self.chunks):
-            if accum_chunks + chunk['chunks'] > i:
-                return idx, i - accum_chunks
-            accum_chunks += chunk['chunks']
-        raise ValueError(f"Index {i} out of range")
-
     def __getitem__(self, i):
-        idx, offset = self.map_idx(i)
-        chunk = self.chunks[idx]
+        chunk = self.chunks[i]
         conn = self.get_conn()
+        chunk_data = []
         with conn.cursor() as cur:
-            if chunk['tbl'] == 'chats':
-                cur.execute("SELECT chat FROM chats WHERE id = %s", (chunk['ref'],))
-                resp = cur.fetchone()
-                data = self.tokenizer.encode(resp[0])
-            else:
-                cur.execute(sql.SQL("SELECT content FROM {} WHERE id = %s").format(sql.Identifier(chunk['tbl'])), (chunk['ref'],))
-                txt = cur.fetchone()
-                data = self.tokenizer.encode_text({'content':txt[0]})
+            for idx, s in enumerate(chunk['src']):
+                cur.execute(sql.SQL("SELECT content FROM {} WHERE id = %s").format(sql.Identifier(s['tbl'])), (s['ref'],))
+                txt = cur.fetchone()[0]
+                if idx == 0 and s['ofs'] == 0:
+                    chunk_data.append(self.tokenizer.get_token_id('<TXT>'))
+                elif s['ofs'] == 0:
+                    chunk_data.append(self.tokenizer.get_token_id('</TXT>'))
+                    chunk_data.append(self.tokenizer.get_token_id('<TXT>'))
+                chunk_data.extend(self.tokenizer.encode_simple(txt)[s['ofs']:s['ofs']+s['len']])
+                if idx == len(chunk['src']) - 1 and s['ofs'] + s['len'] == len(self.tokenizer.encode_simple(txt)):
+                    chunk_data.append(self.tokenizer.get_token_id('</TXT>'))
         self.release_conn(conn)
-        start = offset * self.config.window_size
-        end = start + self.config.window_size
-        input_ids = data[start:end]
+        input_ids = chunk_data
 
-        input_ids_tensor = torch.tensor(input_ids[:self.config.window_size], dtype=torch.long)
-        # Pad sequence to desired length.
-        padding_size = self.config.window_size - len(input_ids_tensor)
-        padding_tensor = torch.full((padding_size,), self.tokenizer.get_token_id('<PAD>'))
-        padded_input_ids = torch.cat([input_ids_tensor, padding_tensor])
+        input_ids_tensor = torch.tensor(input_ids, dtype=torch.long)
+        labels_tensor = torch.cat([input_ids_tensor[1:], torch.tensor([-100])])
+        return dict(input_ids=input_ids_tensor, labels=labels_tensor)
 
-        # Shift labels by one position for language model training
-        labels_tensor = torch.cat([padded_input_ids[1:],torch.tensor([-100])])
-        return dict(input_ids=padded_input_ids, labels=labels_tensor)
+    def __len__(self):
+        return len(self.chunks)
 
 @dataclass
 class DataCollatorForSqlDataset(object):
