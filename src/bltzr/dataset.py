@@ -1,4 +1,5 @@
 import torch
+import os
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2 import sql
@@ -35,7 +36,11 @@ class SqlDataset(Dataset):
         super(SqlDataset, self).__init__()
         self.config = config
         self.tokenizer = Tokenizer()
+        self.with_metadata = False
+        if os.environ.get('LLM_TRAIN_WITH_METADATA'):
+            self.with_metadata = True
         self.chunks = []
+
         # Create a connection pool
         self.pool = SimpleConnectionPool(
             minconn=1,
@@ -43,14 +48,14 @@ class SqlDataset(Dataset):
             dsn="dbname={} user={} host={}".format(config.db_name, config.db_user, config.db_host)
         )
         conn = self.get_conn()
-        print("Calculating dataset length, hold on...")
+        print("Building dataset index, hold on...")
         with conn.cursor() as cur:
             cur.execute(sql.SQL("SELECT tbl, ref_id FROM {}").format(sql.Identifier(config.dataset_table)))
             rows = cur.fetchall()
             chunk = {"src": []}
             payload_added = 0
             for row in rows:
-                cur.execute(f"SELECT * FROM get_dataset_item_len('{row[0]}', '{row[1]}')")
+                cur.execute(f"SELECT * FROM get_dataset_item_len('{row[0]}', '{row[1]}', {self.with_metadata})")
                 txt_len = cur.fetchone()[0]
                 remaining_len = txt_len
                 ofs = 0
@@ -78,7 +83,7 @@ class SqlDataset(Dataset):
             for idx, s in enumerate(chunk['src']):
                 tbl = s['tbl']
                 ref = s['ref']
-                cur.execute(f"SELECT * FROM get_dataset_item('{tbl}', '{ref}')")
+                cur.execute(f"SELECT * FROM get_dataset_item('{tbl}', '{ref}', {self.with_metadata})")
                 msgs = cur.fetchone()[0]
                 chunk_data.extend(self.tokenizer.encode(msgs)[s['ofs']:s['ofs']+s['len']])
         self.release_conn(conn)
