@@ -10,9 +10,10 @@ from .tokenizer import Tokenizer
 # This is not an optimal implementation -- although
 # the actual data lives in Postgres, when we init the class
 # we need to calculate the length of the whole dataset, so we iterate all
-# the elements in it. (It's probably worth storing the length of `content` fields in the table too)
-# And we build a mapping index (as one document can span several chunks (window_size that is)
-# and store it in memory.
+# the elements in it. 
+#
+# And as we go, we build a mapping index (as one document can span several chunks, where
+# chunks equals `window_size`), which is stored in memory.
 
 @dataclass
 class SqlDatasetConfig:
@@ -49,7 +50,7 @@ class SqlDataset(Dataset):
             chunk = {"src": []}
             payload_added = 0
             for row in rows:
-                cur.execute(sql.SQL("SELECT octet_length(content) FROM {} WHERE id = %s").format(sql.Identifier(row[0])), (row[1],))
+                cur.execute(f"SELECT * FROM get_dataset_item_len('{row[0]}', '{row[1]}')")
                 txt_len = cur.fetchone()[0]
                 remaining_len = txt_len
                 ofs = 0
@@ -75,16 +76,11 @@ class SqlDataset(Dataset):
         chunk_data = []
         with conn.cursor() as cur:
             for idx, s in enumerate(chunk['src']):
-                cur.execute(sql.SQL("SELECT content FROM {} WHERE id = %s").format(sql.Identifier(s['tbl'])), (s['ref'],))
-                txt = cur.fetchone()[0]
-                if idx == 0 and s['ofs'] == 0:
-                    chunk_data.append(self.tokenizer.get_token_id('<TXT>'))
-                elif s['ofs'] == 0:
-                    chunk_data.append(self.tokenizer.get_token_id('</TXT>'))
-                    chunk_data.append(self.tokenizer.get_token_id('<TXT>'))
-                chunk_data.extend(self.tokenizer.encode_simple(txt)[s['ofs']:s['ofs']+s['len']])
-                if idx == len(chunk['src']) - 1 and s['ofs'] + s['len'] == len(self.tokenizer.encode_simple(txt)):
-                    chunk_data.append(self.tokenizer.get_token_id('</TXT>'))
+                tbl = s['tbl']
+                ref = s['ref']
+                cur.execute(f"SELECT * FROM get_dataset_item('{tbl}', '{ref}')")
+                msgs = cur.fetchone()[0]
+                chunk_data.extend(self.tokenizer.encode(msgs)[s['ofs']:s['ofs']+s['len']])
         self.release_conn(conn)
         input_ids = chunk_data
 
