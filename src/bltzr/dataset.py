@@ -25,7 +25,7 @@ class SqlDatasetConfig:
 class SqlDataset(Dataset):
     def _get_cache_path(self):
         # Create a unique cache file name based on dataset parameters
-        cache_key = f"{self.config.dataset_table}_{self.config.window_size}_{self.with_metadata}"
+        cache_key = f"{self.config.dataset_table}_{self.config.window_size}_{self.config.with_metadata}"
         # Add database name to make sure we don't mix indices from different databases
         cache_key = f"{self.config.db_name}_{cache_key}"
         # Create a hash to keep filename reasonable length
