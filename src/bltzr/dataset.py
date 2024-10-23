@@ -3,6 +3,7 @@ import hashlib
 import os.path
 from pathlib import Path
 import torch
+from tqdm import tqdm
 import os
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
@@ -89,40 +90,28 @@ class SqlDataset(Dataset):
         conn = self.get_conn()
         print("Building dataset index, hold on...")
         with conn.cursor() as cur:
-             # Create a temporary table to store lengths
-            cur.execute("""
-              CREATE TEMP TABLE item_lengths AS
-              SELECT
-                  d.tbl,
-                  d.ref_id,
-                  get_dataset_item_len(d.tbl, d.ref_id, %s) as length
-              FROM {} d
-            """.format(config.dataset_table), (self.config.with_metadata,))
-            # Fetch all lengths at once
-            cur.execute("SELECT tbl, ref_id, length FROM item_lengths ORDER BY tbl, ref_id")
+            cur.execute(sql.SQL("SELECT tbl, ref_id FROM {}").format(sql.Identifier(config.dataset_table)))
+            rows = cur.fetchall()
             chunk = {"src": []}
             payload_added = 0
-
-            for tbl, ref_id, txt_len in cur.fetchall():
+            for row in tqdm(rows):
+                cur.execute(f"SELECT * FROM get_dataset_item_len('{row[0]}', '{row[1]}', {self.config.with_metadata})")
+                txt_len = cur.fetchone()[0]
                 remaining_len = txt_len
                 ofs = 0
                 while remaining_len > 0:
                     payload_len = min(self.config.window_size - payload_added, remaining_len)
-                    chunk["src"].append({ "tbl": tbl, "ref": ref_id, "ofs": ofs, "len": payload_len })
+                    chunk["src"].append({"tbl": row[0], "ref": row[1], "ofs": ofs, "len": payload_len})
                     payload_added += payload_len
                     remaining_len -= payload_len
                     ofs += payload_len
-
                     if payload_added >= self.config.window_size:
                         self.chunks.append(chunk)
                         chunk = {"src": []}
                         payload_added = 0
-
             if payload_added > 0:
                 chunk["last"] = True
                 self.chunks.append(chunk)
-            # Clean up
-            cur.execute("DROP TABLE item_lengths")
         print("Done!")
         self.release_conn(conn)
         # Save the index to cache
