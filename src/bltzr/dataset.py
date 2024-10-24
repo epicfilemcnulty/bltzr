@@ -22,49 +22,64 @@ class SqlDatasetConfig:
     with_metadata: bool = False
     dataset_table: str = "dataset"
     window_size: int = 8192
+    cache_save_percent: int = 5
 
 class SqlDataset(Dataset):
     def _get_cache_path(self):
-        # Create a unique cache file name based on dataset parameters
-        cache_key = f"{self.config.dataset_table}_{self.config.window_size}_{self.config.with_metadata}"
-        # Add database name to make sure we don't mix indices from different databases
-        cache_key = f"{self.config.db_name}_{cache_key}"
-        # Create a hash to keep filename reasonable length
+        cache_key = f"{self.config.db_name}_{self.config.dataset_table}_{self.config.window_size}_{self.config.with_metadata}"
         cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
-        # Use a dedicated directory for cache files
         cache_dir = Path.home() / ".cache" / "dataset_indices"
         cache_dir.mkdir(parents=True, exist_ok=True)
         return cache_dir / f"dataset_index_{cache_hash}.json"
 
-    def _save_index(self):
+    def _save_index(self, complete=True):
         cache_path = self._get_cache_path()
-        print(f"Saving dataset index to {cache_path}")
-        # Convert chunks to a serializable format
+        print(f"Saving {'complete' if complete else 'partial'} dataset index to {cache_path}")
+
         serializable_chunks = []
-        for chunk in self.chunks:
-            # Create a new dict with all fields except any that might not be JSON serializable
+        for i, chunk in enumerate(self.chunks):
             serializable_chunk = {
-                "src": chunk["src"],
-                "last": chunk.get("last", False)
+                "src": chunk["src"]
             }
+            # Only add 'last' field to the final chunk
+            if i == len(self.chunks) - 1:
+                serializable_chunk["last"] = chunk.get("last", False)
+
             serializable_chunks.append(serializable_chunk)
 
+        cache_data = {
+            "chunks": serializable_chunks,
+            "complete": complete,
+            "processed_rows": getattr(self, 'processed_rows', 0)
+        }
+
         with open(cache_path, 'w') as f:
-            json.dump(serializable_chunks, f)
+            json.dump(cache_data, f)
 
     def _load_index(self):
         cache_path = self._get_cache_path()
         if not cache_path.exists():
-            return False
+            return False, 0
 
         print(f"Loading dataset index from {cache_path}")
         try:
             with open(cache_path, 'r') as f:
-                self.chunks = json.load(f)
-            return True
+                cache_data = json.load(f)
+
+            self.chunks = cache_data["chunks"]
+            is_complete = cache_data.get("complete", False)
+            processed_rows = cache_data.get("processed_rows", 0)
+
+            if is_complete:
+                print("Loaded complete index from cache")
+                return True, processed_rows
+            else:
+                print(f"Loaded partial index from cache (processed {processed_rows} rows)")
+                return False, processed_rows
+
         except (json.JSONDecodeError, IOError) as e:
             print(f"Failed to load cache file: {e}")
-            return False
+            return False, 0
 
     def get_conn(self):
         return self.pool.getconn()
@@ -78,44 +93,82 @@ class SqlDataset(Dataset):
         self.tokenizer = Tokenizer()
         self.chunks = []
 
-        # Create a connection pool
         self.pool = SimpleConnectionPool(
             minconn=1,
             maxconn=20,
-            dsn="dbname={} user={} password={} host={}".format(config.db_name, config.db_user, config.db_pass, config.db_host)
+            dsn="dbname={} user={} password={} host={}".format(
+                config.db_name, config.db_user, config.db_pass, config.db_host
+            )
         )
-        # Try to load the index from cache first
-        if self._load_index():
+        # Try to load the index from cache
+        is_complete, processed_rows = self._load_index()
+        if is_complete:
             return
+
         conn = self.get_conn()
         print("Building dataset index, hold on...")
-        with conn.cursor() as cur:
-            cur.execute(sql.SQL("SELECT tbl, ref_id FROM {}").format(sql.Identifier(config.dataset_table)))
-            rows = cur.fetchall()
-            chunk = {"src": []}
-            payload_added = 0
-            for row in tqdm(rows):
-                cur.execute(f"SELECT * FROM get_dataset_item_len('{row[0]}', '{row[1]}', {self.config.with_metadata})")
-                txt_len = cur.fetchone()[0]
-                remaining_len = txt_len
-                ofs = 0
-                while remaining_len > 0:
-                    payload_len = min(self.config.window_size - payload_added, remaining_len)
-                    chunk["src"].append({"tbl": row[0], "ref": row[1], "ofs": ofs, "len": payload_len})
-                    payload_added += payload_len
-                    remaining_len -= payload_len
-                    ofs += payload_len
-                    if payload_added >= self.config.window_size:
-                        self.chunks.append(chunk)
-                        chunk = {"src": []}
-                        payload_added = 0
-            if payload_added > 0:
-                chunk["last"] = True
-                self.chunks.append(chunk)
+
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql.SQL("SELECT tbl, ref_id FROM {}").format(
+                    sql.Identifier(config.dataset_table)
+                ))
+                rows = cur.fetchall()
+                total_rows = len(rows)
+
+                # Skip already processed rows
+                rows = rows[processed_rows:]
+
+                # Initialize or continue with last chunk
+                chunk = {"src": []} if not self.chunks else self.chunks[-1]
+                payload_added = sum(s['len'] for s in chunk["src"]) if chunk["src"] else 0
+
+                last_save_percentage = (processed_rows / total_rows) * 100 if total_rows > 0 else 0
+
+                for i, row in enumerate(tqdm(rows)):
+                    cur.execute(
+                        f"SELECT * FROM get_dataset_item_len('{row[0]}', '{row[1]}', {self.config.with_metadata})"
+                    )
+                    txt_len = cur.fetchone()[0]
+                    remaining_len = txt_len
+                    ofs = 0
+
+                    while remaining_len > 0:
+                        payload_len = min(self.config.window_size - payload_added, remaining_len)
+                        chunk["src"].append({
+                            "tbl": row[0],
+                            "ref": row[1],
+                            "ofs": ofs,
+                            "len": payload_len
+                        })
+                        payload_added += payload_len
+                        remaining_len -= payload_len
+                        ofs += payload_len
+
+                        if payload_added >= self.config.window_size:
+                            self.chunks.append(chunk)
+                            chunk = {"src": []}
+                            payload_added = 0
+
+                    # Update processed rows count
+                    self.processed_rows = processed_rows + i + 1
+
+                    # Save progress every 4%
+                    current_percentage = (self.processed_rows / total_rows) * 100
+                    if current_percentage - last_save_percentage >= self.config.cache_save_percent:
+                        self._save_index(complete=False)
+                        last_save_percentage = current_percentage
+
+                if payload_added > 0:
+                    chunk["last"] = True
+                    self.chunks.append(chunk)
+
+        finally:
+            self.release_conn(conn)
+
         print("Done!")
-        self.release_conn(conn)
-        # Save the index to cache
-        self._save_index()
+        # Save the final complete index
+        self._save_index(complete=True)
 
     def __getitem__(self, i):
         chunk = self.chunks[i]
