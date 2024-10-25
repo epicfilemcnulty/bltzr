@@ -22,9 +22,11 @@ class SqlDatasetConfig:
     with_metadata: bool = False
     dataset_table: str = "dataset"
     window_size: int = 8192
-    cache_save_percent: int = 5
+    cache_save_percent: int = 25
+    batch_size: int = 100
 
 class SqlDataset(Dataset):
+
     def _get_cache_path(self):
         cache_key = f"{self.config.db_name}_{self.config.dataset_table}_{self.config.window_size}_{self.config.with_metadata}"
         cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
@@ -34,7 +36,8 @@ class SqlDataset(Dataset):
 
     def _save_index(self, complete=True):
         cache_path = self._get_cache_path()
-        print(f"Saving {'complete' if complete else 'partial'} dataset index to {cache_path}")
+        if complete:
+            print(f"Saving dataset index to {cache_path}")
 
         serializable_chunks = []
         for i, chunk in enumerate(self.chunks):
@@ -118,57 +121,64 @@ class SqlDataset(Dataset):
 
                 # Skip already processed rows
                 rows = rows[processed_rows:]
-
+              
                 # Initialize or continue with last chunk
                 chunk = {"src": []} if not self.chunks else self.chunks[-1]
                 payload_added = sum(s['len'] for s in chunk["src"]) if chunk["src"] else 0
 
-                last_save_percentage = (processed_rows / total_rows) * 100 if total_rows > 0 else 0
+                last_save_percentage = (processed_rows / total_rows) * 100 if total_rows > 0 else 0                
 
-                for i, row in enumerate(tqdm(rows)):
-                    cur.execute(
-                        f"SELECT * FROM get_dataset_item_len('{row[0]}', '{row[1]}', {self.config.with_metadata})"
-                    )
-                    txt_len = cur.fetchone()[0]
-                    remaining_len = txt_len
-                    ofs = 0
+                for i in tqdm(range(0, len(rows), self.config.batch_size)):
+                    batch_rows = rows[i:i + self.config.batch_size]
+                    tbls = [row[0] for row in batch_rows]
+                    ref_ids = [row[1] for row in batch_rows]
+                    
+                    # Create arrays for the PL/Lua function
+                    query = f"SELECT * FROM get_dataset_items_len(ARRAY[{','.join(f"""'{tbl}'""" for tbl in tbls)}]::text[], ARRAY[{','.join(str(ref_id) for ref_id in ref_ids)}]::bigint[], {self.config.with_metadata})"
+                    cur.execute(query)
+                    lengths = cur.fetchone()[0]
 
-                    while remaining_len > 0:
-                        payload_len = min(self.config.window_size - payload_added, remaining_len)
-                        chunk["src"].append({
-                            "tbl": row[0],
-                            "ref": row[1],
-                            "ofs": ofs,
-                            "len": payload_len
-                        })
-                        payload_added += payload_len
-                        remaining_len -= payload_len
-                        ofs += payload_len
+                    # Process each item in the batch
+                    for j, txt_len in enumerate(lengths):
+                        remaining_len = txt_len
+                        ofs = 0
+                        while remaining_len > 0:
+                            payload_len = min(
+                                self.config.window_size - payload_added,
+                                remaining_len
+                            )
+                            chunk["src"].append({
+                                "tbl": batch_rows[j][0],
+                                "ref": batch_rows[j][1],
+                                "ofs": ofs,
+                                "len": payload_len
+                            })
+                            payload_added += payload_len
+                            remaining_len -= payload_len
+                            ofs += payload_len
 
-                        if payload_added >= self.config.window_size:
-                            self.chunks.append(chunk)
-                            chunk = {"src": []}
-                            payload_added = 0
+                            if payload_added >= self.config.window_size:
+                                self.chunks.append(chunk)
+                                chunk = {"src": []}
+                                payload_added = 0
 
-                    # Update processed rows count
-                    self.processed_rows = processed_rows + i + 1
+                        # Update processed rows count
+                        self.processed_rows = processed_rows + i + 1
 
-                    # Save progress every 4%
-                    current_percentage = (self.processed_rows / total_rows) * 100
-                    if current_percentage - last_save_percentage >= self.config.cache_save_percent:
-                        self._save_index(complete=False)
-                        last_save_percentage = current_percentage
-
+                        # Save progress every `cache_save_percent`
+                        current_percentage = (self.processed_rows / total_rows) * 100
+                        if current_percentage - last_save_percentage >= self.config.cache_save_percent:
+                            self._save_index(complete=False)
+                            last_save_percentage = current_percentage
                 if payload_added > 0:
                     chunk["last"] = True
                     self.chunks.append(chunk)
-
+                    
         finally:
             self.release_conn(conn)
-
         print("Done!")
-        # Save the final complete index
-        self._save_index(complete=True)
+        # Save the index to cache
+        self._save_index()
 
     def __getitem__(self, i):
         chunk = self.chunks[i]
